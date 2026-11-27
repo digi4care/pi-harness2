@@ -16,7 +16,7 @@ import type {
   ToolExecutionRecord,
 } from "./types.js";
 
-type EvolutionMode = "auto" | "review";
+type EvolutionMode = "auto" | "review" | "off";
 
 interface HarnessSettings {
   mode?: EvolutionMode;
@@ -91,7 +91,7 @@ export interface HarnessOptions {
 }
 
 export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
-  let currentMode: EvolutionMode = "review";
+  let currentMode: EvolutionMode = "off";
   let cycleHandled = false;
   let lastCwd: string | undefined;
   const pendingProposals = new Map<string, HarnessProposal>();
@@ -186,7 +186,8 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
       const settingsFile = getHarnessPaths(detectHost(hostCwd)).settingsFile;
       if (!fs.existsSync(settingsFile)) return {};
       const parsed = JSON.parse(fs.readFileSync(settingsFile, "utf-8")) as HarnessSettings;
-      if (parsed?.mode === "auto" || parsed?.mode === "review") return parsed;
+      // Missing or invalid values fall through to the built-in `off` default.
+      if (parsed?.mode === "auto" || parsed?.mode === "review" || parsed?.mode === "off") return parsed;
       return {};
     } catch {
       return {};
@@ -426,6 +427,10 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
    * recording through the current cwd.
    */
   async function finalizeSession(ctx: HarnessContext, opts: FinalizeOptions): Promise<void> {
+    // `off` disables all automatic session reads, outcome bookkeeping, and
+    // evolution — explicit commands (/harness-reflect, /harness-report, …)
+    // remain the only way to touch session data.
+    if (currentMode === "off") return;
     const hostInfo = detectHost(ctx.cwd);
     const ledger = new ImprovementLedger(hostInfo);
     const { timeline, records } = readSession(hostInfo, ctx.cwd);
@@ -444,6 +449,10 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
    * project's mode — before the new project's persisted state loads.
    */
   async function finalizeOutgoing(snap: OutgoingSnapshot, opts: FinalizeOptions): Promise<void> {
+    // Same `off` gate as finalizeSession: no automatic reads/bookkeeping for a
+    // project whose mode is off. Snapshots are normally never captured in off
+    // mode (see session_before_switch); this guards stale snapshots.
+    if (snap.mode === "off") return;
     const ledger = new ImprovementLedger(snap.hostInfo);
     const sessionStart = snap.timeline[0]?.timestamp ?? Date.now();
     updateOutcomes(ledger, snap.timeline, snap.records, sessionStart);
@@ -481,8 +490,11 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
       autoAppliedKeys.clear();
     }
     lastCwd = normCwd;
+    // Recompute from THIS project's settings every time: a missing/invalid
+    // override resolves to the built-in `off` default, so a previous project's
+    // mode never leaks into a project without its own setting.
     const persisted = loadSettings(ctx.cwd);
-    if (persisted.mode) currentMode = persisted.mode;
+    currentMode = persisted.mode ?? "off";
     const hostInfo = detectHost(ctx.cwd);
     ctx.ui.notify(
       `[pi-harness2] Active on ${hostInfo.host.toUpperCase()} (${hostInfo.projectConfigDir}) [Mode: ${currentMode}]`,
@@ -501,6 +513,12 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
   // Registered only when the host adapter supplies these OMP-only events.
   if (options.sessionBeforeSwitchEvent) {
     pi.on(options.sessionBeforeSwitchEvent, (_event, ctx) => {
+      // `off` means no automatic session reads: don't even capture the
+      // outgoing recording for switch finalization.
+      if (currentMode === "off") {
+        pendingSwitch = undefined;
+        return;
+      }
       try {
         const hostInfo = detectHost(ctx.cwd);
         const { timeline, records } = readSession(hostInfo, ctx.cwd);
@@ -894,19 +912,20 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
   });
 
   pi.registerCommand("harness-mode", {
-    description: "Toggle between auto or review evolution mode",
+    description: "Toggle between off, review, or auto evolution mode",
     getArgumentCompletions: (prefix: string): HarnessAutocompleteItem[] | null => {
       const lower = prefix.toLowerCase().trim();
       const modes: HarnessAutocompleteItem[] = [
-        { value: "auto", label: "auto", description: "Automatically apply grounded proposals after session" },
+        { value: "off", label: "off", description: "Disable automatic session analysis and evolution (default)" },
         { value: "review", label: "review", description: "Hold proposals for manual /harness-apply review" },
+        { value: "auto", label: "auto", description: "Automatically apply grounded proposals after session" },
       ];
       const matches = modes.filter((m) => m.value.startsWith(lower));
       return matches.length > 0 ? matches : null;
     },
     handler: async (args, ctx) => {
       const mode = args.trim().toLowerCase();
-      if (mode === "auto" || mode === "review") {
+      if (mode === "auto" || mode === "review" || mode === "off") {
         currentMode = mode;
         saveSettings(ctx.cwd, { mode: currentMode });
         ctx.ui.notify(
@@ -914,7 +933,7 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
           "info",
         );
       } else {
-        ctx.ui.notify(`[pi-harness2] Current mode: ${currentMode}. Options: auto, review`, "info");
+        ctx.ui.notify(`[pi-harness2] Current mode: ${currentMode}. Options: off, review, auto`, "info");
       }
     },
   });
