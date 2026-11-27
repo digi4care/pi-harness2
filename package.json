@@ -70,6 +70,7 @@
   },
   "files": [
     "extensions/",
+    "agents/",
     "DESIGN.md",
     "README.md",
     "CHANGELOG.md",
