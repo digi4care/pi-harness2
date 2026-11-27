@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { HostInfo } from "./host-detector.js";
-import type { FrictionPoint, TimelineEvent, ToolExecutionRecord } from "./types.js";
+import type { FrictionPoint, HostType, TimelineEvent, ToolExecutionRecord } from "./types.js";
 
 export interface SessionData {
   timeline: TimelineEvent[];
@@ -61,7 +61,7 @@ function readBytesFrom(file: string, start: number, length: number): string {
   }
 }
 
-function readSessionLine(file: string): { cwd?: string } | undefined {
+function readSessionLine(file: string): { cwd?: string; id?: string; timestamp?: string } | undefined {
   try {
     const fd = fs.openSync(file, "r");
     let bytes: number;
@@ -167,6 +167,99 @@ export function findSessionFile(hostInfo: HostInfo, cwd: string): string | undef
 
 const MAX_SESSION_BYTES = 4 * 1024 * 1024;
 const PREVIEW_LEN = 500;
+
+/**
+ * One discovered session recording for a single explicit host/project scope.
+ * Identity is host + normalized project cwd + canonical discovered file path;
+ * the host-native session id and recording start timestamp are captured when
+ * the recording's first session header provides them.
+ */
+export interface SessionCatalogEntry {
+  /** Host that recorded the session. */
+  host: HostType;
+  /** Normalized (symlink-resolved) project cwd this recording belongs to. */
+  projectCwd: string;
+  /** Canonical (symlink-resolved) path of the discovered recording file. */
+  filePath: string;
+  /** Host-native session id from the recording header, when present. */
+  sessionId?: string;
+  /** Recording start time in ms since epoch (header timestamp), when present. */
+  startedAt?: number;
+}
+
+/**
+ * Enumerate every valid recording for ONE explicit host/project scope, newest
+ * first. Only the given host's session root is scanned (PI_HARNESS_SESSIONS_ROOT
+ * overrides it, mirroring findSessionFile) — host roots are never combined, and
+ * no session is auto-selected. A file is included only when the cwd recorded in
+ * its first session header normalizes to the requested project cwd; directory-
+ * name encoding is never trusted as identity. Reads header metadata only —
+ * transcript bodies are never parsed here.
+ */
+export function listSessionRecordings(hostInfo: HostInfo, cwd: string): SessionCatalogEntry[] {
+  const root = process.env.PI_HARNESS_SESSIONS_ROOT ?? path.join(hostInfo.userConfigDir, "sessions");
+  // Same normalization as findSessionFile: hosts may record cwd with different
+  // symlink/trailing-slash spelling.
+  let wantCwd: string;
+  try {
+    wantCwd = fs.realpathSync(cwd);
+  } catch {
+    wantCwd = path.resolve(cwd);
+  }
+
+  let dirs: fs.Dirent[];
+  try {
+    dirs = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const found: Array<{ entry: SessionCatalogEntry; sortKey: number }> = [];
+  for (const dir of dirs) {
+    const dirPath = path.join(root, dir.name);
+    let files: string[];
+    try {
+      if (!fs.statSync(dirPath).isDirectory()) continue; // follows symlinks
+      files = fs.readdirSync(dirPath).filter((f) => f.endsWith(".jsonl"));
+    } catch {
+      continue;
+    }
+    for (const name of files) {
+      const file = path.join(dirPath, name);
+      const header = readSessionLine(file);
+      if (!header || typeof header.cwd !== "string") continue;
+      let recCwd: string;
+      try {
+        recCwd = fs.realpathSync(header.cwd);
+      } catch {
+        recCwd = path.resolve(header.cwd);
+      }
+      if (recCwd !== wantCwd) continue;
+      let filePath: string;
+      let mtimeMs: number;
+      try {
+        filePath = fs.realpathSync(file);
+        mtimeMs = fs.statSync(file).mtimeMs;
+      } catch {
+        continue;
+      }
+      const startedAt = header.timestamp ? Date.parse(header.timestamp) : NaN;
+      found.push({
+        entry: {
+          host: hostInfo.host,
+          projectCwd: wantCwd,
+          filePath,
+          sessionId: typeof header.id === "string" ? header.id : undefined,
+          startedAt: Number.isNaN(startedAt) ? undefined : startedAt,
+        },
+        // Newest-first: header start time when present, file mtime otherwise.
+        sortKey: Number.isNaN(startedAt) ? mtimeMs : startedAt,
+      });
+    }
+  }
+  found.sort((a, b) => b.sortKey - a.sortKey || a.entry.filePath.localeCompare(b.entry.filePath));
+  return found.map((f) => f.entry);
+}
 
 /**
  * Parse a host session recording into a Harness² timeline + tool execution records.
