@@ -2,6 +2,20 @@
 
 All notable changes to `@izhimu/pi-harness2` will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`/harness-sessions` — manual historical session analysis**: analyzes selected host session recordings (including sessions from before the plugin was installed) and renders a transient Markdown report of cross-session patterns, failures, and inefficiencies. Scope defaults to the current host and project; cross-project analysis via an interactive project picker or `--project <path>`. Interactive use offers a paged session selector; noninteractive use requires explicit stable session keys (`--session <key>`, repeatable; `--key` alias) and aborts on unknown keys rather than guessing. The active session is excluded unless `--include-active` is passed.
+- **Fixed snapshots with provenance**: each selected recording is analyzed as a fixed snapshot carrying explicit provenance (`complete` / `partial` / `missing` / `invalid` / …) with window, truncation, and unparsed-line detail, surfaced in the report's Sessions and Gaps sections.
+- **Hard evidence budgets**: at most 5 sessions, 300 events total, 8,000 evidence characters per session, and 20,000 characters aggregate per run.
+- **Host-native execution flows**: on omp, the command enqueues a parent turn that invokes the native `task` tool exactly once with the packaged `harness-reflector` agent (declared `tools: []`, which filters built-in tools only — configured MCP/extension tools may remain available; the agent prompt instructs it not to invoke any tools, but this is not a technical enforcement boundary) and inherits the normal omp model/fallback configuration; on pi, the session's active model is called directly. When model analysis is unavailable, a deterministic fallback report shows only directly observable friction and evidence gaps.
+
+### Changed
+- **Default evolution mode is now `off`**: when no valid project mode is set — including an unrecognized value in `settings.json` — the mode resolves to `off`, disabling all automatic session reads, outcome bookkeeping, and evolution. Explicit mode changes are stored per project in `<baseDir>/harness/settings.json`; there is no global setting. Previously saved `review` and `auto` settings are honored unchanged, and explicit manual commands (`/harness-reflect`, `/harness-report`, `/harness-sessions`, …) remain available in every mode.
+
+### Notes
+- `/harness-sessions` is strictly **report-only and transient**: it creates no lessons or pending proposals, makes no ledger or outcome-tracking changes, writes no files, never auto-applies anything, and keeps no persistent analysis cache.
+
 ## [0.3.1] - 2026-10-25
 
 ### Added

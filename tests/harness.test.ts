@@ -34,7 +34,10 @@ interface MockRuntime {
   command(name: string): MockCommand;
 }
 
-function createMockPi(registerExtension: (pi: ExtensionAPI) => void = piHarness2Extension): MockRuntime {
+function createMockPi(
+  registerExtension: (pi: ExtensionAPI) => void = piHarness2Extension,
+  piProperties: Record<string, unknown> = {},
+): MockRuntime {
   const events = new Map<string, EventHandler>();
   const commands = new Map<string, MockCommand>();
   const mockPi = {
@@ -44,6 +47,7 @@ function createMockPi(registerExtension: (pi: ExtensionAPI) => void = piHarness2
     registerCommand: (name: string, def: unknown) => {
       commands.set(name, def as MockCommand);
     },
+    ...piProperties,
   } as unknown as ExtensionAPI;
   registerExtension(mockPi);
   return {
@@ -61,8 +65,19 @@ function createMockPi(registerExtension: (pi: ExtensionAPI) => void = piHarness2
   };
 }
 
-function createMockCtx(cwd: string, notifications?: string[]) {
-  const ctx = {
+interface MockContext {
+  cwd: string;
+  ui: {
+    notify: (message: string) => void;
+    select?: (title: string, options: string[]) => Promise<string | undefined>;
+  };
+  reload: () => Promise<void>;
+  reloadCount: number;
+  waitForIdle: () => Promise<void>;
+}
+
+function createMockCtx(cwd: string, notifications?: string[]): MockContext {
+  const ctx: MockContext = {
     cwd,
     ui: { notify: (msg: string) => notifications?.push(msg) },
     reload: async () => {
@@ -134,6 +149,38 @@ describe("pi-harness2 test suite", () => {
     durationMs: 10,
     content: [{ type: "text", text: err }],
   });
+  const captureSessionKeys = async (
+    rt: MockRuntime,
+    ctx: MockContext,
+    projectCwd: string,
+    sessionIds: string[],
+  ): Promise<Map<string, string>> => {
+    const keys = new Map<string, string>();
+    ctx.ui.select = async (_title, options) => {
+      for (const sessionId of sessionIds) {
+        const option = options.find((candidate) => candidate.includes(`· ${sessionId} ·`) && candidate.includes("key="));
+        const key = option ? /\bkey=(\S+)/.exec(option)?.[1] : undefined;
+        if (key) keys.set(sessionId, key);
+      }
+      return "Cancel";
+    };
+    await rt.command("harness-sessions").handler(
+      `--project "${projectCwd}"`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+    return keys;
+  };
+
+  const evidenceCharacterCounts = (prompt: string): number[] => {
+    const evidence = prompt.split("\n# Evidence\n")[1] ?? "";
+    const sessions = evidence.split(/(?=## Session \d+:)/).filter((block) => block.startsWith("## Session "));
+    return sessions.map((block) =>
+      block
+        .split("\n")
+        .filter((line) => line.startsWith("[event "))
+        .reduce((count, line) => count + line.length + 1, 0),
+    );
+  };
 
   const ompHostIn = (dir = tmpDir) => ({
     host: "omp" as const,
@@ -1234,6 +1281,310 @@ describe("pi-harness2 test suite", () => {
   // extension wiring (commands + events)
   // -------------------------------------------------------------------------
 
+
+  test("fresh OMP projects default to off while historical analysis remains manually available", async () => {
+    const cwd = path.join(tmpDir, "fresh-off-project");
+    fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+    const handoffs: string[] = [];
+    const notifications: string[] = [];
+    const rt = createMockPi(piHarness2Extension, {
+      sendUserMessage: async (content: string) => {
+        handoffs.push(content);
+      },
+    });
+    const ctx = createMockCtx(cwd, notifications);
+
+    await rt.fire("session_start", ctx);
+    await rt.command("harness-mode").handler("", ctx as unknown as ExtensionCommandContext);
+    expect(notifications.some((message) => message.includes("Mode: off"))).toBe(true);
+    expect(notifications.some((message) => message.includes("Current mode: off"))).toBe(true);
+
+    writeSessionFixture(
+      [toolError("off-1", "off-mode historical failure"), toolError("off-2", "second failure")],
+      "off-manual",
+      cwd,
+    );
+    await rt.fire("agent_end", ctx);
+    expect(notifications.some((message) => message.includes("harness improvement proposals available"))).toBe(false);
+
+    const keys = await captureSessionKeys(rt, ctx, cwd, ["off-manual"]);
+    const key = keys.get("off-manual");
+    expect(key).toBeDefined();
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" --session "${key}"`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]).toContain(`Key: ${key}`);
+    expect(handoffs[0]).toContain("off-mode historical failure");
+    const host = detectHost(cwd);
+    expect(new ImprovementLedger(host).getEntries()).toEqual([]);
+    expect(new ExperienceLibrary(host).all()).toEqual([]);
+    expect(fs.existsSync(path.join(cwd, ".omp", "harness"))).toBe(false);
+    expect(rt.command("harness-apply").getArgumentCompletions?.("")?.map((item) => item.value)).toEqual(["all"]);
+  });
+
+  test("sessionManager excludes only the active recording unless --include-active is supplied", async () => {
+    const cwd = path.join(tmpDir, "active-session-project");
+    fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+    const handoffs: string[] = [];
+    const notifications: string[] = [];
+    const rt = createMockPi(piHarness2Extension, {
+      sendUserMessage: async (content: string) => {
+        handoffs.push(content);
+      },
+    });
+    const ctx = createMockCtx(cwd, notifications);
+    const activeFile = writeSessionFixture([toolError("active", "active recording evidence")], "z-active-recording", cwd);
+    writeSessionFixture([toolError("other", "other recording evidence")], "a-other-recording", cwd);
+    const keys = await captureSessionKeys(rt, ctx, cwd, ["z-active-recording", "a-other-recording"]);
+    const activeKey = keys.get("z-active-recording");
+    const otherKey = keys.get("a-other-recording");
+
+    expect(activeKey).toBeDefined();
+    expect(otherKey).toBeDefined();
+    Object.assign(ctx, {
+      sessionManager: {
+        getSessionFile: () => activeFile,
+        getSessionId: () => "z-active-recording",
+      },
+    });
+
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" --session "${activeKey}"`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+    expect(notifications.some((message) => message.includes("requested session(s) are the active session"))).toBe(true);
+    expect(handoffs).toHaveLength(0);
+
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" --session "${activeKey}" --include-active`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]).toContain("active recording evidence");
+
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" --session "${otherKey}"`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+    expect(handoffs).toHaveLength(2);
+    expect(handoffs[1]).toContain("other recording evidence");
+  });
+
+  test("quoted project paths and stable session keys reach Pi's direct completion adapter", async () => {
+    process.env.PI_HARNESS_HOST_OVERRIDE = "pi";
+    const currentProject = path.join(tmpDir, "current-pi-project");
+    const projectWithSpaces = path.join(tmpDir, "archive project with spaces");
+    fs.mkdirSync(path.join(currentProject, ".pi"), { recursive: true });
+    fs.mkdirSync(path.join(projectWithSpaces, ".pi"), { recursive: true });
+    const rt = createMockPi(piHarness2PiExtension as unknown as (pi: ExtensionAPI) => void);
+    const notifications: string[] = [];
+    const ctx = Object.assign(createMockCtx(currentProject, notifications), { model: { id: "test-model" } });
+    writeSessionFixture(
+      [{ role: "user", content: [{ type: "text", text: "quoted project historical evidence" }] }],
+      "quoted-project-session",
+      projectWithSpaces,
+    );
+    const keys = await captureSessionKeys(rt, ctx, projectWithSpaces, ["quoted-project-session"]);
+    const key = keys.get("quoted-project-session");
+    expect(key).toBeDefined();
+
+    const prompts: string[] = [];
+    mock.module("@earendil-works/pi-ai/compat", () => ({
+      completeSimple: async (_model: unknown, options: { messages: Array<{ content: string }> }) => {
+        prompts.push(options.messages[0]!.content);
+        return { stopReason: "stop", content: [{ type: "text", text: "# Pi completed report" }] };
+      },
+    }));
+    try {
+      await rt.command("harness-sessions").handler(
+        `--project "${projectWithSpaces}" --session "${key}"`,
+        ctx as unknown as ExtensionCommandContext,
+      );
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toContain(`Key: ${key}`);
+      expect(prompts[0]).toContain(`project=${projectWithSpaces}`);
+      expect(prompts[0]).toContain("quoted project historical evidence");
+      expect(notifications).toContain("# Pi completed report");
+    } finally {
+      mock.restore();
+    }
+  });
+
+  test("selected historical snapshots report complete and partial provenance", async () => {
+    const cwd = path.join(tmpDir, "snapshot-project");
+    fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+    const handoffs: string[] = [];
+    const rt = createMockPi(piHarness2Extension, {
+      sendUserMessage: async (content: string) => {
+        handoffs.push(content);
+      },
+    });
+    const ctx = createMockCtx(cwd);
+    writeSessionFixture(
+      [{ role: "user", content: [{ type: "text", text: "complete snapshot marker" }] }],
+      "complete-snapshot",
+      cwd,
+    );
+    writeSessionFixture(
+      [
+        { role: "user", content: [{ type: "text", text: `large prefix ${"x".repeat(4 * 1024 * 1024 + 100)}` }] },
+        { role: "user", content: [{ type: "text", text: "partial snapshot tail evidence" }] },
+      ],
+      "partial-snapshot",
+      cwd,
+    );
+    const keys = await captureSessionKeys(rt, ctx, cwd, ["complete-snapshot", "partial-snapshot"]);
+    const completeKey = keys.get("complete-snapshot");
+    const partialKey = keys.get("partial-snapshot");
+    expect(completeKey).toBeDefined();
+    expect(partialKey).toBeDefined();
+
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" --session "${completeKey}" --session "${partialKey}"`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]).toContain(`key=${completeKey}`);
+    expect(handoffs[0]).toContain(`key=${partialKey}`);
+    expect(handoffs[0]).toContain("snapshot=complete");
+    expect(handoffs[0]).toContain("snapshot=partial");
+    expect(handoffs[0]).toContain("truncatedHead=false");
+    expect(handoffs[0]).toContain("truncatedHead=true");
+    expect(handoffs[0]).toContain("droppedLeadingLine=true");
+    expect(handoffs[0]).toContain("complete snapshot marker");
+    expect(handoffs[0]).toContain("partial snapshot tail evidence");
+    expect(handoffs[0]).toMatch(/window=0-\d+\/\d+/);
+    expect(handoffs[0]).toMatch(/window=[1-9]\d*-\d+\/\d+/);
+  });
+
+  test("historical selection caps at five sessions and 300 events", async () => {
+    const cwd = path.join(tmpDir, "session-event-bounds-project");
+    fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+    const handoffs: string[] = [];
+    const notifications: string[] = [];
+    const rt = createMockPi(piHarness2Extension, {
+      sendUserMessage: async (content: string) => {
+        handoffs.push(content);
+      },
+    });
+    const ctx = createMockCtx(cwd, notifications);
+    const ids = Array.from({ length: 6 }, (_, index) => `event-bound-${index}`);
+    const messages = Array.from({ length: 100 }, (_, index) => ({
+      role: "user",
+      content: [{ type: "text", text: `event-${index}` }],
+    }));
+    for (const id of ids) writeSessionFixture(messages, id, cwd);
+    const keys = await captureSessionKeys(rt, ctx, cwd, ids);
+    const selectedKeys = ids.slice(0, 5).map((id) => keys.get(id)!);
+
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" ${selectedKeys.map((key) => `--session "${key}"`).join(" ")}`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]).toContain("Budgets: sessions=5/5, events=300/300");
+
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" ${ids.map((id) => `--session "${keys.get(id)}"`).join(" ")}`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+    expect(handoffs).toHaveLength(1);
+    expect(notifications.some((message) => message.includes("Select at most 5 sessions (got 6)"))).toBe(true);
+  });
+
+  test("historical evidence respects per-session and aggregate character limits", async () => {
+    const cwd = path.join(tmpDir, "character-bounds-project");
+    fs.mkdirSync(path.join(cwd, ".omp"), { recursive: true });
+    const handoffs: string[] = [];
+    const rt = createMockPi(piHarness2Extension, {
+      sendUserMessage: async (content: string) => {
+        handoffs.push(content);
+      },
+    });
+    const ctx = createMockCtx(cwd);
+    const ids = Array.from({ length: 5 }, (_, index) => `character-bound-${index}`);
+    const messages = Array.from({ length: 60 }, (_, index) => ({
+      role: "user",
+      content: [{ type: "text", text: `${index}-${"x".repeat(220)}` }],
+    }));
+    for (const id of ids) writeSessionFixture(messages, id, cwd);
+    const keys = await captureSessionKeys(rt, ctx, cwd, ids);
+    await rt.command("harness-sessions").handler(
+      `--project "${cwd}" ${ids.map((id) => `--session "${keys.get(id)}"`).join(" ")}`,
+      ctx as unknown as ExtensionCommandContext,
+    );
+
+    expect(handoffs).toHaveLength(1);
+    const perSession = evidenceCharacterCounts(handoffs[0]!);
+    expect(perSession).toHaveLength(5);
+    expect(perSession[0]).toBeGreaterThan(7_500);
+    expect(perSession.every((count) => count <= 8_000)).toBe(true);
+    const aggregate = perSession.reduce((total, count) => total + count, 0);
+    expect(aggregate).toBeGreaterThan(19_000);
+    expect(aggregate).toBeLessThanOrEqual(20_000);
+    expect(handoffs[0]).toContain(`evidenceChars=${aggregate}/20000`);
+  });
+
+  test("historical analysis falls back deterministically when OMP sender or Pi model fails", async () => {
+    const ompCwd = path.join(tmpDir, "failed-omp-project");
+    fs.mkdirSync(path.join(ompCwd, ".omp"), { recursive: true });
+    process.env.PI_HARNESS_HOST_OVERRIDE = "omp";
+    const ompNotifications: string[] = [];
+    let senderCalls = 0;
+    const ompRt = createMockPi(piHarness2Extension, {
+      sendUserMessage: async () => {
+        senderCalls++;
+        throw new Error("parent queue unavailable");
+      },
+    });
+    const ompCtx = createMockCtx(ompCwd, ompNotifications);
+    writeSessionFixture(
+      [toolError("sender-1", "sender failure evidence"), toolError("sender-2", "second sender failure")],
+      "sender-failure-session",
+      ompCwd,
+    );
+    const ompKeys = await captureSessionKeys(ompRt, ompCtx, ompCwd, ["sender-failure-session"]);
+    await ompRt.command("harness-sessions").handler(
+      `--project "${ompCwd}" --session "${ompKeys.get("sender-failure-session")}"`,
+      ompCtx as unknown as ExtensionCommandContext,
+    );
+    expect(senderCalls).toBe(1);
+    expect(ompNotifications.some((message) => message.includes("Model analysis unavailable"))).toBe(true);
+    expect(ompNotifications.some((message) => message.includes("parent queue unavailable"))).toBe(true);
+    expect(ompNotifications.some((message) => message.includes("sender-failure-session"))).toBe(true);
+
+    const piCwd = path.join(tmpDir, "failed-pi-project");
+    fs.mkdirSync(path.join(piCwd, ".pi"), { recursive: true });
+    process.env.PI_HARNESS_HOST_OVERRIDE = "pi";
+    const piNotifications: string[] = [];
+    const piRt = createMockPi(piHarness2PiExtension as unknown as (pi: ExtensionAPI) => void);
+    const piCtx = Object.assign(createMockCtx(piCwd, piNotifications), { model: { id: "test-model" } });
+    writeSessionFixture(
+      [toolError("model-1", "model failure evidence"), toolError("model-2", "second model failure")],
+      "model-failure-session",
+      piCwd,
+    );
+    const piKeys = await captureSessionKeys(piRt, piCtx, piCwd, ["model-failure-session"]);
+    mock.module("@earendil-works/pi-ai/compat", () => ({
+      completeSimple: async () => {
+        throw new Error("model offline");
+      },
+    }));
+    try {
+      await piRt.command("harness-sessions").handler(
+        `--project "${piCwd}" --session "${piKeys.get("model-failure-session")}"`,
+        piCtx as unknown as ExtensionCommandContext,
+      );
+      expect(piNotifications.some((message) => message.includes("Model analysis unavailable: model offline"))).toBe(true);
+      expect(piNotifications.some((message) => message.includes("model-failure-session"))).toBe(true);
+    } finally {
+      mock.restore();
+    }
+  });
   test("OMP auto switch finalization should use the outgoing snapshot when a newer clean same-cwd session exists", async () => {
     const dir = path.join(tmpDir, "switch-snapshot-project");
     fs.mkdirSync(path.join(dir, ".omp"), { recursive: true });
@@ -1302,6 +1653,7 @@ describe("pi-harness2 test suite", () => {
     const ctxA = createMockCtx(dirA, notificationsA);
     const ctxB = createMockCtx(dirB, notificationsB);
     await rt.fire("session_start", ctxA);
+    await rt.command("harness-mode").handler("review", ctxA as unknown as ExtensionCommandContext);
     writeSessionFixture(
       [toolError("state-1", "failure one"), toolError("state-2", "failure two")],
       "state-outgoing",
@@ -1599,6 +1951,8 @@ describe("pi-harness2 test suite", () => {
     const ctx = createMockCtx(tmpDir, notifications);
 
     await rt.fire("session_start", ctx);
+    await rt.command("harness-mode").handler("review", ctx as unknown as ExtensionCommandContext);
+
     writeSessionFixture([toolError("pi-f1", "failure one"), toolError("pi-f2", "failure two")], "pi-agent-settled");
     await rt.fire("agent_settled", ctx);
 
@@ -1612,6 +1966,8 @@ describe("pi-harness2 test suite", () => {
     const ctx = createMockCtx(tmpDir, notifications);
 
     await rt.fire("session_start", ctx);
+    await rt.command("harness-mode").handler("review", ctx as unknown as ExtensionCommandContext);
+
     writeSessionFixture([toolError("f1", "fail 1"), toolError("f2", "fail 2")]);
 
     // Cycle 1 settles: diagnosis notifies (session_start banner was notification 1)
@@ -1629,6 +1985,8 @@ describe("pi-harness2 test suite", () => {
     fs.mkdirSync(path.join(tmpDir, ".omp"), { recursive: true });
     const rt = createMockPi();
     const ctx = createMockCtx(tmpDir);
+
+    await rt.command("harness-mode").handler("review", ctx as unknown as ExtensionCommandContext);
 
     writeSessionFixture([toolError("f1", "fail 1"), toolError("f2", "fail 2")]);
     await rt.fire("agent_end", ctx);
@@ -1649,6 +2007,8 @@ describe("pi-harness2 test suite", () => {
     fs.mkdirSync(path.dirname(rulesFile), { recursive: true });
     const lines200 = Array.from({ length: 200 }, (_, i) => `- Rule ${i}: invariant`).join("\n");
     fs.writeFileSync(rulesFile, `<!-- pi-harness2:rules:start -->\n${lines200}\n<!-- pi-harness2:rules:end -->\n`, "utf-8");
+
+    await rt.command("harness-mode").handler("review", ctx as unknown as ExtensionCommandContext);
 
     writeSessionFixture([toolError("f1", "fail 1"), toolError("f2", "fail 2")]);
     await rt.fire("agent_end", ctx);
@@ -1752,6 +2112,8 @@ describe("pi-harness2 test suite", () => {
     const ctxB = createMockCtx(dirB, notificationsB);
 
     await rt.fire("session_start", ctxA);
+    await rt.command("harness-mode").handler("review", ctxA as unknown as ExtensionCommandContext);
+
     writeSessionFixture([toolError("fail-tool", "error 1"), toolError("fail-tool", "error 2")], "s-a", dirA);
     await rt.fire("agent_end", ctxA);
 
@@ -1938,6 +2300,8 @@ describe("pi-harness2 test suite", () => {
     const rt = createMockPi();
     const ctx = createMockCtx(tmpDir);
 
+    await rt.command("harness-mode").handler("review", ctx as unknown as ExtensionCommandContext);
+
     writeSessionFixture([toolError("e1", "fail 1"), toolError("e2", "fail 2")], "rl-s1", tmpDir, tsInDays(20));
     await rt.fire("session_shutdown", ctx, { reason: "quit" });
     const ledger = new ImprovementLedger(detectHost(tmpDir));
@@ -1996,6 +2360,7 @@ describe("pi-harness2 test suite", () => {
     const rt = createMockPi();
     const ctx = createMockCtx(tmpDir);
 
+    await rt.command("harness-mode").handler("review", ctx as unknown as ExtensionCommandContext);
     const correctionSession = [
       // The assistant proposes, the user corrects — prior-context corroboration
       { role: "assistant", content: [{ type: "text", text: "我打算用全局大事务来处理这批审批" }] },

@@ -42,8 +42,9 @@ When an agent encounters friction — such as tool execution retry loops, syntax
 - 🔒 **Hardened Apply Path**: Per-component path fencing (skills only under `skills/`, scripts only under `scripts/`, …), symlink traversal refusal, and best-effort syntax checks (`bash -n`, `python ast`, `node --check`) for generated scripts.
 - 📜 **Immutable Ledger & 1-Click Rollback**: Records full content diffs, session IDs, timestamps, and previous contents in `<baseDir>/harness/ledger.json` (lock-guarded, entry-validated, size-capped). Atomically revert any mutation with `/harness-rollback <id>`.
 - 📊 **Visual Analytics & Health Reports**: Rich ANSI terminal cards via `/harness-report` plus an exportable Markdown dashboard written to `<baseDir>/harness/reports/`.
-- 🎛️ **Dual Evolution Modes** (persisted in `<baseDir>/harness/settings.json`):
-  - `review` (default): After each agent cycle, diagnosed proposals are held for interactive inspection and explicit approval via `/harness-apply`.
+- 🎛️ **Evolution Modes** (persisted in `<baseDir>/harness/settings.json`):
+  - `off` (default): Automatic session analysis and evolution are disabled; explicit commands such as `/harness-reflect` and `/harness-sessions` remain available on demand.
+  - `review`: After each agent cycle, diagnosed proposals are held for interactive inspection and explicit approval via `/harness-apply`.
   - `auto`: At session shutdown, automatically applies evidence-grounded proposals (recorded tool failures, LLM proposals that passed grounding). Heuristic user-correction rules are still held for review to protect your rulebook from noise.
   - **Trust boundary**: `auto` mode applies LLM-derived content without human review. Safeguards (component path fencing, script syntax checks, evidence grounding, sanitized error snippets, immutable rollback ledger) constrain *where* and *what shape* mutations take, but they do not human-review the *content*. Prefer `review` mode in repositories whose tool outputs you do not trust.
 
@@ -104,10 +105,44 @@ omp -e ./extensions/index.ts
 | `/harness-report` | _none_ | Display visual health metrics, tool error hotspots, active components, and recent mutations |
 | `/harness-ledger` | _none_ | View immutable history of committed harness adaptations and their status |
 | `/harness-rollback` | `<commit-id>` | Atomically roll back an applied mutation by ID with tab completion |
-| `/harness-mode` | `<auto \| review>` | Toggle between automatic post-session evolution and interactive manual review |
+| `/harness-mode` | `<off \| review \| auto>` | Set the evolution mode: `off` (default; no automatic analysis or evolution), `review`, or `auto` |
+| `/harness-sessions` | `[--project <path>] [--include-active] [--session <key>]...` | Analyze selected historical session recordings across sessions; report-only, nothing is persisted |
 
 ### Interactive Autocompletion
 All commands taking parameters (`/harness-apply`, `/harness-rollback`, `/harness-mode`) provide live argument completions with labels and context descriptions in both pi and omp.
+
+---
+
+## Historical Session Analysis (`/harness-sessions`)
+
+`/harness-sessions` runs a manual, on-demand analysis over **historical** host session recordings — including sessions from before pi-harness2 was installed — and returns a transient Markdown report of cross-session patterns, failures, and inefficiencies.
+
+```
+/harness-sessions [--project <path>] [--include-active] [--session <stable-key>]...
+```
+
+### Selection & Scope
+
+- **Default scope** is the current host and current project. To analyze another project, run the command with no arguments and pick a project from the interactive picker, or pass `--project <path>` explicitly.
+- **Interactive use** (no `--session`): a paged selector lists the project's recorded sessions; pick up to 5.
+- **Noninteractive use** requires explicit stable session keys via `--session <key>` (repeatable; `--key` is an alias). Unknown keys abort with an error — sessions are never guessed.
+- The **active session is excluded by default**; pass `--include-active` to include it.
+
+### Budgets & Evidence
+
+Analysis runs over fixed snapshots of the selected recordings, each carrying explicit provenance (`complete`, `partial`, `missing`, `invalid`, …) with window, truncation, and unparsed-line detail, so gaps in the evidence are visible in the report rather than silently analyzed around. Hard budgets bound every run: **≤ 5 sessions, ≤ 300 events total, ≤ 8,000 evidence characters per session, ≤ 20,000 characters aggregate**.
+
+### Report-Only by Design
+
+The output is a transient report rendered in the terminal. `/harness-sessions` **never** creates lessons or pending proposals, never touches the ledger or outcome tracking, never writes files, never auto-applies anything, and keeps no persistent analysis cache. Re-running it re-analyzes from the recordings.
+
+### Host Execution Flow
+
+- **omp**: the command enqueues a parent turn that invokes the native `task` tool **exactly once** with the packaged `harness-reflector` agent for all selected sessions combined, then renders the result. The reflector inherits your normal omp model and fallback configuration.
+- **pi**: the session's active model is called directly with the same evidence prompt.
+- If model analysis is unavailable on either host, a deterministic fallback report is shown (directly observable friction and evidence gaps only — no invented findings).
+
+> **Trust note**: the packaged `harness-reflector` agent declares `tools: []`, which filters only its **built-in** tools — configured MCP/extension tools may remain available to it. Its prompt instructs it not to invoke any available tools, but that is an instruction, not a technical isolation boundary. As with `auto` mode, prefer running it in contexts whose tool surface you trust.
 
 ---
 
