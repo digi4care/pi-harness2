@@ -61,6 +61,16 @@ function readBytesFrom(file: string, start: number, length: number): string {
   }
 }
 
+function parseSessionHeader(head: string): { cwd?: string; id?: string; timestamp?: string } | undefined {
+  const sessionLine = head.split("\n").find((l) => l.includes('"type":"session"'));
+  if (!sessionLine) return undefined;
+  try {
+    return JSON.parse(sessionLine) as { cwd?: string; id?: string; timestamp?: string };
+  } catch {
+    return undefined;
+  }
+}
+
 function readSessionLine(file: string): { cwd?: string; id?: string; timestamp?: string } | undefined {
   try {
     const fd = fs.openSync(file, "r");
@@ -71,10 +81,20 @@ function readSessionLine(file: string): { cwd?: string; id?: string; timestamp?:
     } finally {
       fs.closeSync(fd);
     }
-    const head = buf.subarray(0, bytes).toString("utf-8");
-    const sessionLine = head.split("\n").find((l) => l.includes('"type":"session"'));
-    if (!sessionLine) return undefined;
-    return JSON.parse(sessionLine) as { cwd?: string };
+    return parseSessionHeader(buf.subarray(0, bytes).toString("utf-8"));
+  } catch {
+    return undefined;
+  }
+}
+
+// Header read from an already-open descriptor: the snapshot reader must verify
+// identity against the very inode it will consume, not against a second open
+// of the path (which could resolve to a replaced file).
+function readSessionHeaderFromFd(fd: number): { cwd?: string; id?: string; timestamp?: string } | undefined {
+  try {
+    const buf = Buffer.alloc(8192);
+    const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+    return parseSessionHeader(buf.subarray(0, bytes).toString("utf-8"));
   } catch {
     return undefined;
   }
@@ -262,6 +282,81 @@ export function listSessionRecordings(hostInfo: HostInfo, cwd: string): SessionC
 }
 
 /**
+ * Parse one complete JSONL line into timeline/record entries. Returns an empty
+ * array for lines that are not message entries (or hold no usable content),
+ * and undefined for lines that look like message entries but fail JSON.parse —
+ * the snapshot reader counts those as unparsed evidence. Pure: no cache, no I/O.
+ */
+function parseSessionEntryLine(line: string): ParsedEntry[] | undefined {
+  const out: ParsedEntry[] = [];
+  if (!line.includes('"message"')) return out;
+  let entry: { timestamp?: string; message?: Record<string, unknown> };
+  try {
+    entry = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  const msg = entry.message;
+  if (!msg || typeof msg !== "object") return out;
+  const ts = entry.timestamp ? Date.parse(entry.timestamp) || Date.now() : Date.now();
+  const role = msg.role;
+  const bytes = line.length + 1;
+
+  if (role === "user") {
+    const text = textOf(msg.content).trim();
+    if (text) {
+      const ev: TimelineEvent = { timestamp: ts, type: "user_message", content: stripAnsi(text) };
+      out.push({ bytes, timeline: ev });
+    }
+  } else if (role === "assistant") {
+    const content = Array.isArray(msg.content) ? msg.content : [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const b = block as Record<string, unknown>;
+      if (b.type === "toolCall") {
+        const ev: TimelineEvent = {
+          timestamp: ts,
+          type: "tool_call",
+          toolName: typeof b.name === "string" ? b.name : undefined,
+          toolCallId: typeof b.id === "string" ? b.id : undefined,
+          // Args feed call→error pairing and success/failure diffs, so keep
+          // more than a preview; the diagnostic prompt budget bounds size.
+          content: JSON.stringify(b.arguments ?? {}).slice(0, 1000),
+        };
+        out.push({ bytes, timeline: ev });
+      } else if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
+        const ev: TimelineEvent = { timestamp: ts, type: "assistant_thought", content: stripAnsi(b.text.trim()) };
+        out.push({ bytes, timeline: ev });
+      }
+    }
+  } else if (role === "toolResult") {
+    const toolName = typeof msg.toolName === "string" ? msg.toolName : "unknown";
+    const isError = Boolean(msg.isError);
+    const durationMs = typeof msg.durationMs === "number" ? msg.durationMs : 0;
+    const preview = stripAnsi(textOf(msg.content).trim()).slice(0, PREVIEW_LEN) || undefined;
+    const rec: ToolExecutionRecord = {
+      toolName,
+      input: undefined,
+      outputPreview: preview,
+      isError,
+      durationMs,
+      timestamp: ts,
+    };
+    const ev: TimelineEvent = {
+      timestamp: ts,
+      type: "tool_result",
+      toolName,
+      toolCallId: typeof msg.toolCallId === "string" ? msg.toolCallId : undefined,
+      content: preview || (isError ? "Execution failed" : "Execution succeeded"),
+      isError,
+      durationMs,
+    };
+    out.push({ bytes, timeline: ev, record: rec });
+  }
+  return out;
+}
+
+/**
  * Parse a host session recording into a Harness² timeline + tool execution records.
  * Format (pi & omp): JSONL, entries `{type:"message", message:{role, content, ...}}`
  * with content blocks `[{type:"text"|"thinking"|"toolCall", ...}]`.
@@ -314,72 +409,11 @@ export function readSession(hostInfo: HostInfo, cwd: string): SessionData {
     state.offset = start + consumed + Buffer.byteLength(complete, "utf-8");
 
     for (const line of complete.split("\n")) {
-      if (!line.includes('"message"')) continue;
-      let entry: { timestamp?: string; message?: Record<string, unknown> };
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      const msg = entry.message;
-      if (!msg || typeof msg !== "object") continue;
-      const ts = entry.timestamp ? Date.parse(entry.timestamp) || Date.now() : Date.now();
-      const role = msg.role;
-
-      if (role === "user") {
-        const text = textOf(msg.content).trim();
-        if (text) {
-          const ev: TimelineEvent = { timestamp: ts, type: "user_message", content: stripAnsi(text) };
-          state.entries.push({ bytes: line.length + 1, timeline: ev });
-          state.totalBytes += line.length + 1;
-        }
-      } else if (role === "assistant") {
-        const content = Array.isArray(msg.content) ? msg.content : [];
-        for (const block of content) {
-          if (!block || typeof block !== "object") continue;
-          const b = block as Record<string, unknown>;
-          if (b.type === "toolCall") {
-            const ev: TimelineEvent = {
-              timestamp: ts,
-              type: "tool_call",
-              toolName: typeof b.name === "string" ? b.name : undefined,
-              toolCallId: typeof b.id === "string" ? b.id : undefined,
-              // Args feed call→error pairing and success/failure diffs, so keep
-              // more than a preview; the diagnostic prompt budget bounds size.
-              content: JSON.stringify(b.arguments ?? {}).slice(0, 1000),
-            };
-            state.entries.push({ bytes: line.length + 1, timeline: ev });
-            state.totalBytes += line.length + 1;
-          } else if (b.type === "text" && typeof b.text === "string" && b.text.trim()) {
-            const ev: TimelineEvent = { timestamp: ts, type: "assistant_thought", content: stripAnsi(b.text.trim()) };
-            state.entries.push({ bytes: line.length + 1, timeline: ev });
-            state.totalBytes += line.length + 1;
-          }
-        }
-      } else if (role === "toolResult") {
-        const toolName = typeof msg.toolName === "string" ? msg.toolName : "unknown";
-        const isError = Boolean(msg.isError);
-        const durationMs = typeof msg.durationMs === "number" ? msg.durationMs : 0;
-        const preview = stripAnsi(textOf(msg.content).trim()).slice(0, PREVIEW_LEN) || undefined;
-        const rec: ToolExecutionRecord = {
-          toolName,
-          input: undefined,
-          outputPreview: preview,
-          isError,
-          durationMs,
-          timestamp: ts,
-        };
-        const ev: TimelineEvent = {
-          timestamp: ts,
-          type: "tool_result",
-          toolName,
-          toolCallId: typeof msg.toolCallId === "string" ? msg.toolCallId : undefined,
-          content: preview || (isError ? "Execution failed" : "Execution succeeded"),
-          isError,
-          durationMs,
-        };
-        state.entries.push({ bytes: line.length + 1, timeline: ev, record: rec });
-        state.totalBytes += line.length + 1;
+      const parsed = parseSessionEntryLine(line);
+      if (!parsed) continue;
+      for (const p of parsed) {
+        state.entries.push(p);
+        state.totalBytes += p.bytes;
       }
     }
 
@@ -406,6 +440,257 @@ export function readSession(hostInfo: HostInfo, cwd: string): SessionData {
     if (e.record) records.push(e.record);
   }
   return { timeline, records };
+}
+
+/**
+ * Outcome of one immutable historical read of an explicitly selected recording:
+ * - complete: the watermark covers the whole file and no edge line was dropped
+ * - partial: the tail window truncated the head and/or an incomplete edge line
+ *   was dropped — provenance flags say which
+ * - empty: the recording exists but holds no bytes
+ * - missing: the catalog path no longer exists
+ * - unreadable: open/stat/read failed for another reason
+ * - changed: the opened file no longer matches the approved catalog identity
+ *   (replaced, re-pointed, or truncated after selection) — nothing was consumed
+ * - invalid: the opened file has no parseable session header
+ */
+export type SessionSnapshotStatus =
+  | "complete"
+  | "partial"
+  | "empty"
+  | "missing"
+  | "unreadable"
+  | "changed"
+  | "invalid";
+
+/**
+ * Immutable read watermark captured from the opened descriptor at selection
+ * time. `size` is the fixed upper bound of the read window: bytes appended
+ * after capture are never consumed. `dev`/`ino` are captured when the platform
+ * provides them so later steps can re-verify they hold the same inode.
+ */
+export interface SessionSnapshotWatermark {
+  host: HostType;
+  projectCwd: string;
+  filePath: string;
+  sessionId?: string;
+  startedAt?: number;
+  dev?: number;
+  ino?: number;
+  size: number;
+  mtimeMs: number;
+}
+
+/** Offsets and flags describing exactly which bytes of the watermark were consumed. */
+export interface SessionSnapshotProvenance {
+  watermark: SessionSnapshotWatermark;
+  /** Consumed byte range [windowStart, windowEnd); windowEnd === watermark.size. */
+  windowStart: number;
+  windowEnd: number;
+  /** The window starts past byte 0: the head of the file was not read. */
+  truncatedHead: boolean;
+  /** A partial line at the window's leading edge was skipped. */
+  droppedLeadingLine: boolean;
+  /** A trailing line without a newline terminator was not consumed. */
+  droppedTrailingLine: boolean;
+  /** Window lines that looked like message entries but failed JSON.parse. */
+  unparsedLines: number;
+}
+
+export interface SessionSnapshot {
+  status: SessionSnapshotStatus;
+  /** Parsed events, same shape as readSession(); non-empty only for complete/partial. */
+  timeline: TimelineEvent[];
+  records: ToolExecutionRecord[];
+  /** Present once a watermark was captured (empty/complete/partial/changed/invalid). */
+  provenance?: SessionSnapshotProvenance;
+  /** Short reason for non-complete statuses. */
+  detail?: string;
+}
+
+function snapshotFailure(
+  status: SessionSnapshotStatus,
+  detail: string,
+  provenance?: SessionSnapshotProvenance,
+): SessionSnapshot {
+  return { status, timeline: [], records: [], provenance, detail };
+}
+
+/**
+ * Read one explicitly selected recording as an immutable historical snapshot.
+ *
+ * The file is opened exactly once; the watermark (identity, dev/ino, size,
+ * mtime) is captured from that descriptor, and exactly the fixed tail
+ * [max(0, size - MAX_SESSION_BYTES), size) is read through positioned reads on
+ * the same descriptor — bytes appended later are never consumed. Identity is
+ * re-verified against the opened inode (canonical path still resolves, header
+ * cwd normalizes to the catalog project, native session id and header start
+ * time match when the catalog captured them); any drift reports `changed`
+ * instead of silently consuming another version. The recording format does not
+ * record the host, so `host` is carried from the catalog entry and anchored by
+ * the path + header checks.
+ *
+ * Parsing goes through the same per-line helper as readSession() but never
+ * touches the lifecycle parse cache: no state is persisted, nothing is written,
+ * and ordinary filesystem races surface as statuses, not exceptions.
+ */
+export function readSessionSnapshot(entry: SessionCatalogEntry): SessionSnapshot {
+  let fd: number;
+  try {
+    fd = fs.openSync(entry.filePath, "r");
+  } catch (err) {
+    const code = (err as { code?: string } | undefined)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return snapshotFailure("missing", "Recording no longer exists at its catalog path");
+    }
+    return snapshotFailure("unreadable", `Could not open recording (${code ?? "unknown error"})`);
+  }
+  try {
+    let st: fs.Stats;
+    try {
+      st = fs.fstatSync(fd);
+    } catch (err) {
+      const code = (err as { code?: string } | undefined)?.code;
+      return snapshotFailure("unreadable", `Could not stat opened recording (${code ?? "unknown error"})`);
+    }
+
+    // The catalog path must still resolve to the same canonical file; a swapped
+    // symlink or removed directory entry means another version sits at that path.
+    try {
+      if (fs.realpathSync(entry.filePath) !== entry.filePath) {
+        return snapshotFailure("changed", "Catalog path no longer resolves to the recorded canonical file");
+      }
+    } catch {
+      return snapshotFailure("changed", "Catalog path no longer resolves to the recorded canonical file");
+    }
+
+    const watermark: SessionSnapshotWatermark = {
+      host: entry.host,
+      projectCwd: entry.projectCwd,
+      filePath: entry.filePath,
+      sessionId: entry.sessionId,
+      startedAt: entry.startedAt,
+      dev: typeof st.dev === "number" ? st.dev : undefined,
+      ino: typeof st.ino === "number" ? st.ino : undefined,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+    };
+    const noWindow: Omit<SessionSnapshotProvenance, "watermark"> = {
+      windowStart: 0,
+      windowEnd: 0,
+      truncatedHead: false,
+      droppedLeadingLine: false,
+      droppedTrailingLine: false,
+      unparsedLines: 0,
+    };
+
+    if (st.size === 0) {
+      return snapshotFailure("empty", "Recording is empty", { watermark, ...noWindow });
+    }
+
+    // Identity re-verification against the opened inode's own header.
+    const header = readSessionHeaderFromFd(fd);
+    if (!header || typeof header.cwd !== "string") {
+      return snapshotFailure("invalid", "Opened recording has no parseable session header", { watermark, ...noWindow });
+    }
+    let headerCwd: string;
+    try {
+      headerCwd = fs.realpathSync(header.cwd);
+    } catch {
+      headerCwd = path.resolve(header.cwd);
+    }
+    if (headerCwd !== entry.projectCwd) {
+      return snapshotFailure("changed", "Recording header cwd no longer matches the catalog project", { watermark, ...noWindow });
+    }
+    if (entry.sessionId !== undefined && header.id !== entry.sessionId) {
+      return snapshotFailure("changed", "Recording session id no longer matches the catalog entry", { watermark, ...noWindow });
+    }
+    const headerStart = header.timestamp ? Date.parse(header.timestamp) : NaN;
+    if (entry.startedAt !== undefined && headerStart !== entry.startedAt) {
+      return snapshotFailure("changed", "Recording start time no longer matches the catalog entry", { watermark, ...noWindow });
+    }
+    // The header is authoritative when the catalog lacked optional fields.
+    watermark.sessionId = typeof header.id === "string" ? header.id : watermark.sessionId;
+    watermark.startedAt = Number.isNaN(headerStart) ? watermark.startedAt : headerStart;
+
+    const windowStart = Math.max(0, st.size - MAX_SESSION_BYTES);
+    const windowEnd = st.size;
+    const buf = Buffer.alloc(windowEnd - windowStart);
+    let readTotal = 0;
+    try {
+      while (readTotal < buf.length) {
+        const n = fs.readSync(fd, buf, readTotal, buf.length - readTotal, windowStart + readTotal);
+        if (n <= 0) break;
+        readTotal += n;
+      }
+    } catch (err) {
+      const code = (err as { code?: string } | undefined)?.code;
+      return snapshotFailure("unreadable", `Could not read recording window (${code ?? "unknown error"})`);
+    }
+    if (readTotal < buf.length) {
+      // The file shrank between fstat and read: the watermarked version is gone.
+      return snapshotFailure("changed", "Recording was truncated after the watermark was captured", { watermark, ...noWindow });
+    }
+
+    // Edge alignment on bytes, then a single decode of exactly the consumed
+    // window — no intermediate full-window strings.
+    let startByte = 0;
+    let droppedLeadingLine = false;
+    if (windowStart > 0) {
+      const nl = buf.indexOf(0x0a);
+      startByte = nl === -1 ? buf.length : nl + 1;
+      droppedLeadingLine = nl > 0;
+    }
+    const lastNl = buf.lastIndexOf(0x0a);
+    const endByte = lastNl === -1 ? 0 : lastNl + 1;
+    const droppedTrailingLine = endByte < buf.length;
+    const truncatedHead = windowStart > 0;
+
+    const timeline: TimelineEvent[] = [];
+    const records: ToolExecutionRecord[] = [];
+    let unparsedLines = 0;
+    if (endByte > startByte) {
+      const text = buf.subarray(startByte, endByte).toString("utf-8");
+      for (const line of text.split("\n")) {
+        if (line.length === 0) continue;
+        const parsed = parseSessionEntryLine(line);
+        if (parsed === undefined) {
+          unparsedLines++;
+          continue;
+        }
+        for (const p of parsed) {
+          if (p.timeline) timeline.push(p.timeline);
+          if (p.record) records.push(p.record);
+        }
+      }
+    }
+
+    const partial = truncatedHead || droppedLeadingLine || droppedTrailingLine;
+    const provenance: SessionSnapshotProvenance = {
+      watermark,
+      windowStart,
+      windowEnd,
+      truncatedHead,
+      droppedLeadingLine,
+      droppedTrailingLine,
+      unparsedLines,
+    };
+    return {
+      status: partial ? "partial" : "complete",
+      timeline,
+      records,
+      provenance,
+      detail: partial
+        ? `Read tail window [${windowStart}, ${windowEnd}) of ${st.size} bytes; incomplete edge lines were dropped`
+        : undefined,
+    };
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // Descriptor already unusable; the read outcome stands.
+    }
+  }
 }
 
 export function deriveFrictionPoints(records: readonly ToolExecutionRecord[]): FrictionPoint[] {
