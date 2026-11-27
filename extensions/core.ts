@@ -7,6 +7,7 @@ import { ImprovementLedger } from "./ledger.js";
 import { ExperienceReflector, isUserCorrection } from "./reflector.js";
 import { ExperienceLibrary } from "./experience.js";
 import { HarnessReporter } from "./reporter.js";
+import { registerHarnessSessionsCommand } from "./historical-sessions.js";
 import type {
   HarnessProposal,
   HarnessReportData,
@@ -34,6 +35,8 @@ function proposalKey(p: HarnessProposal): string {
  */
 export interface HarnessUI {
   notify(message: string, level?: "info" | "warning" | "error"): void;
+  /** Interactive single-choice selector; absent in noninteractive host modes. */
+  select?(title: string, options: string[]): Promise<string | undefined>;
 }
 
 export interface HarnessContext {
@@ -42,9 +45,22 @@ export interface HarnessContext {
   ui: HarnessUI;
 }
 
+/**
+ * Structural view of the host's session manager (OMP and Pi
+ * `ExtensionCommandContext` both extend an `ExtensionContext` that carries
+ * one). Used only to identify the active session for exclusion from
+ * historical analysis; every method is optional and best-effort.
+ */
+export interface HarnessSessionManager {
+  getSessionId?(): string | undefined;
+  getSessionFile?(): string | undefined;
+}
+
 export interface HarnessCommandContext extends HarnessContext {
   waitForIdle(): Promise<void>;
   reload(): Promise<void>;
+  /** Host session manager, when the host exposes the active session identity. */
+  sessionManager?: HarnessSessionManager;
 }
 
 export interface HarnessAutocompleteItem {
@@ -64,6 +80,8 @@ export type HarnessEventHandler = (event: unknown, ctx: HarnessContext) => void;
 export interface HarnessAPI {
   on(event: string, handler: HarnessEventHandler): void;
   registerCommand(name: string, spec: HarnessCommandSpec): void;
+  /** OMP-only user-message sender; absent in Pi and noninteractive modes. */
+  sendUserMessage?(content: string): void | Promise<void>;
 }
 
 export interface HarnessOptions {
@@ -657,6 +675,11 @@ export function registerHarness(pi: HarnessAPI, options: HarnessOptions) {
     } catch {
       // Session end evolution must never crash host
     }
+  });
+
+  registerHarnessSessionsCommand(pi, {
+    createLLMCaller: options.createLLMCaller,
+    sendUserMessage: pi.sendUserMessage?.bind(pi),
   });
 
   pi.registerCommand("harness-reflect", {
